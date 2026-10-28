@@ -1,0 +1,12 @@
+# Environnements et fichiers techniques
+.venv/
+venv/
+.ipynb_checkpoints/
+__pycache__/
+.DS_Store
+
+# Données et fichiers produits (non versionnés)
+sortie/
+donnees/
+*.parquet
+*.ndjson
