@@ -61,11 +61,25 @@ def fhir_glycemies_quotidien():
         requete = {"code": "http://loinc.org|2345-7", "_count": 100,
                    "_lastUpdated": f"ge{jour(data_interval_start)}"}
         ressources = []
-        # À COMPLÉTER (étape 1) : boucle de pagination de la séance 1, qui remplit `ressources`
-        #   - r = requests.get(url, params=requete, headers={"Accept": "application/fhir+json"}, timeout=30)
-        #   - r.raise_for_status() : une erreur HTTP fait échouer la tâche, donc déclenche un retry
-        #   - ajouter les ressources de bundle["entry"], suivre le lien « next », puis requete = None
-        raise NotImplementedError("Étape 1 à compléter (ou déclencher avec source = fichier)")
+
+        # Étape 1 : on lit la réponse page par page, tant qu'il existe une page suivante
+        while url:
+            r = requests.get(url, params=requete, headers={"Accept": "application/fhir+json"}, timeout=30)
+            r.raise_for_status()                      # erreur HTTP → la tâche échoue → retry
+            bundle = r.json()
+
+            # on garde les ressources de la page
+            for entree in bundle.get("entry", []):
+                ressources.append(entree["resource"])
+
+            # on cherche le lien « next » ; s'il n'y en a pas, url = None et la boucle s'arrête
+            url = None
+            for lien in bundle.get("link", []):
+                if lien["relation"] == "next":
+                    url = lien["url"]
+
+            requete = None                            # le lien « next » contient déjà les paramètres
+
         chemin.write_text("".join(json.dumps(o) + "\n" for o in ressources))
         print(len(ressources), "ressources écrites dans", chemin)
         return str(chemin)                            # XCom : un chemin, pas les données
@@ -75,28 +89,6 @@ def fhir_glycemies_quotidien():
         """Étape 2 : une ligne par Observation (id, patient, date, statut, valeur, unite), en Parquet."""
         import pandas as pd
 
-        # À COMPLÉTER (étape 2) : lire le NDJSON ligne par ligne (json.loads), construire un DataFrame,
-        # l'écrire avec df.to_parquet(sortie, index=False) et renvoyer str(sortie)
-        raise NotImplementedError(        lignes = []
-        for texte in Path(chemin).read_text().splitlines():
-            if not texte.strip():
-                continue                                  # ignore les lignes vides
-            o = json.loads(texte)                         # une Observation FHIR
-            q = o.get("valueQuantity") or {}              # vide si l'examen est annulé
-            lignes.append({
-                "id": o.get("id"),
-                "patient": (o.get("subject") or {}).get("reference"),
-                "date": o.get("effectiveDateTime"),
-                "statut": o.get("status"),
-                "valeur": q.get("value"),
-                "unite": q.get("unit"),
-            })
-
-        df = pd.DataFrame(lignes, columns=["id", "patient", "date", "statut", "valeur", "unite"])
-        sortie = Path(chemin).with_suffix(".parquet")     # même nom, extension .parquet
-        df.to_parquet(sortie, index=False)
-        print(len(df), "lignes ; unités :", df["unite"].value_counts(dropna=False).to_dict())
-        return str(sortie))
         lignes = []
         for texte in Path(chemin).read_text().splitlines():
             if not texte.strip():
@@ -113,10 +105,10 @@ def fhir_glycemies_quotidien():
             })
 
         df = pd.DataFrame(lignes, columns=["id", "patient", "date", "statut", "valeur", "unite"])
-        sortie = Path(chemin).with_suffix(".parquet")     # même nom, extension .parquet
+        sortie = Path(chemin).with_suffix(".parquet")
         df.to_parquet(sortie, index=False)
         print(len(df), "lignes ; unités :", df["unite"].value_counts(dropna=False).to_dict())
-        return str(sortie))
+        return str(sortie)
 
     @task
     def valider(chemin: str) -> str:
@@ -124,18 +116,62 @@ def fhir_glycemies_quotidien():
         import pandas as pd
         import pandera.pandas as pa
 
-        # À COMPLÉTER (étape 3) : schéma avec unite dans UNITES, valeur > 0, patient non nul ;
-        # écrire les lignes valides en Parquet et renvoyer le chemin
-        raise NotImplementedError("Étape 3 à compléter")
+        df = pd.read_parquet(chemin)
+
+        # 1. Le tri : une ligne est valide si elle a un patient, une valeur > 0 et une unité connue
+        regle = df["patient"].notna() & (df["valeur"] > 0) & df["unite"].isin(UNITES)
+        valides = df[regle]
+        rejets = df[~regle]                            # ~ veut dire « l'inverse de »
+
+        # 2. Le contrôle Pandera : on vérifie que les lignes gardées respectent bien le schéma
+        schema = pa.DataFrameSchema({
+            "patient": pa.Column(str, nullable=False),
+            "valeur": pa.Column(float, pa.Check.gt(0), coerce=True),
+            "unite": pa.Column(str, pa.Check.isin(UNITES)),
+        })
+        schema.validate(valides)                       # lève une erreur si une ligne est hors règle
+
+        # 3. On écrit les lignes valides ; les rejets sont gardés à part pour pouvoir les examiner
+        sortie = Path(chemin).with_name(Path(chemin).stem + "_valides.parquet")
+        valides.to_parquet(sortie, index=False)
+        rejets.to_parquet(Path(chemin).with_name(Path(chemin).stem + "_rejets.parquet"), index=False)
+        print(len(valides), "lignes valides,", len(rejets), "lignes rejetées")
+        return str(sortie)
 
     @task(outlets=[glycemies])
     def charger(chemin: str, data_interval_start=None):
         """Étape 4 : DELETE + INSERT du jour dans donnees/entrepot.duckdb, donc rejouable sans doublon."""
         import duckdb
 
-        # À COMPLÉTER (étape 4) : table glycemies (valeur convertie en mg/dL comme en séance 1),
-        # suppression des lignes du jour puis insertion depuis read_parquet(chemin)
-        raise NotImplementedError("Étape 4 à compléter")
+        j = jour(data_interval_start)                  # le jour traité, ex. "2026-11-20"
+        con = duckdb.connect(str(DONNEES / "entrepot.duckdb"))
+
+        # la table est créée une seule fois (au premier lancement)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS glycemies (
+                id VARCHAR, patient VARCHAR, date VARCHAR, statut VARCHAR,
+                valeur_mg_dl DOUBLE, jour DATE
+            )
+        """)
+
+        # idempotence : on supprime d'abord les lignes de ce jour, puis on les réinsère
+        con.execute("DELETE FROM glycemies WHERE jour = CAST(? AS DATE)", [j])
+        con.execute("""
+            INSERT INTO glycemies
+            SELECT id, patient, date, statut,
+                   CASE unite
+                       WHEN 'g/L'    THEN valeur * 100   -- 1 g/L = 100 mg/dL
+                       WHEN 'mmol/L' THEN valeur * 18    -- 1 mmol/L ≈ 18 mg/dL
+                       ELSE valeur                       -- déjà en mg/dL
+                   END,
+                   CAST(? AS DATE)
+            FROM read_parquet(?)
+        """, [j, chemin])
+
+        chargees = con.execute("SELECT count(*) FROM glycemies WHERE jour = CAST(? AS DATE)", [j]).fetchone()[0]
+        total = con.execute("SELECT count(*) FROM glycemies").fetchone()[0]
+        con.close()
+        print(chargees, "glycémies chargées pour le", j, "; total dans l'entrepôt :", total)
 
     charger(valider(aplatir(extraire())))
 
