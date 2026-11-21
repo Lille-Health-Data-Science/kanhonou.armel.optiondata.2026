@@ -21,21 +21,18 @@ def mon_premier_dag():
     @task
     def transformer(stats: dict) -> int:
         return stats["nb_patients"] * 2
+
     @task
     def controler(n: int) -> int:
         if n < 100:
             raise ValueError(f"Volume trop faible : {n} lignes (minimum 100)")
         print(f"Contrôle OK : {n} lignes")
         return n
+
     @task
     def charger(n: int):
         print(f"Chargement de {n} lignes")
-    @task
-    def controler(n: int) -> int:
-        if n < 100:
-            raise ValueError(f"Volume trop faible : {n} lignes (minimum 100)")
-        print(f"Contrôle OK : {n} lignes")
-        return n
+
     charger(controler(transformer(extraire())))
 
 
